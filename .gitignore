@@ -1,0 +1,20 @@
+# Runtime artifacts and every private identity/resource stay outside this public repo.
+result
+result-*
+.direnv/
+__pycache__/
+*.pyc
+*.wsl
+*.tar
+*.tar.gz
+*.zip
+*.pem
+*.key
+id_rsa
+id_ed25519
+keys.txt
+*-keys.txt
+secrets/
+secrets.yaml
+*.enc.yaml
+validation-local.json
