@@ -44,6 +44,36 @@ function wsl.exe {
     '[{"addr_info":[{"family":"inet","local":"172.30.0.9"}]}]'
   } else { throw 'Unexpected WSL operation' }
 }
+# No real HTTP calls: synthetic release bytes and a synthetic immutable SHA.
+function Invoke-WebRequest {
+  param([switch]$UseBasicParsing, [string]$Uri, [string]$OutFile, [int]$TimeoutSec)
+  Record 'download' @{uri=$Uri; path=$OutFile}
+  if ($env:TEST_CASE -eq 'download-failure') {
+    [IO.File]::WriteAllText($OutFile, 'partial download')
+    throw 'Mock network failure'
+  }
+  $body = if ($env:TEST_CASE -eq 'download-bad-hash') { 'corrupt rootfs' } else { 'synthetic rootfs, never imported' }
+  [IO.File]::WriteAllText($OutFile, $body)
+}
+function Invoke-RestMethod {
+  param([string]$Uri, [hashtable]$Headers, [int]$TimeoutSec)
+  Record 'resolve' $Uri
+  if ($env:TEST_CASE -eq 'api-failure') { throw 'Mock GitHub failure' }
+  if ($env:TEST_CASE -eq 'api-empty') { return @() }
+  if ($env:TEST_CASE -eq 'api-bad-sha') { return @([PSCustomObject]@{sha='main'}) }
+  return @([PSCustomObject]@{sha=('b' * 40)})
+}
+function Get-FileHash {
+  param([string]$LiteralPath, [string]$Algorithm)
+  Record 'hash' $LiteralPath
+  $hash = Microsoft.PowerShell.Utility\Get-FileHash -LiteralPath $LiteralPath -Algorithm $Algorithm
+  # Exercise ALL default parameters without downloading the real 578 MB asset.
+  if ($env:TEST_CASE -eq 'defaults') {
+    if ([IO.File]::ReadAllText($LiteralPath) -cne 'synthetic rootfs, never imported') { throw 'Unexpected mock rootfs' }
+    $hash.Hash = 'e7180ad555fdcb8e1e057e2ef056de467603a5e502ff8531053738371be3f6b9'
+  }
+  return $hash
+}
 function netsh.exe {
   $call = @($args); Record 'netsh' $call; $global:LASTEXITCODE=0
   if ($call -contains 'show') {
@@ -87,7 +117,8 @@ function Test-NetConnection {
   return $env:TEST_CASE -ne 'ssh-down'
 }
 $options = Get-Content -LiteralPath $env:TEST_OPTIONS -Raw | ConvertFrom-Json -AsHashtable
-& $env:TEST_SCRIPT @options
+$positional = @($env:TEST_POSITIONAL | ConvertFrom-Json)
+& $env:TEST_SCRIPT @positional @options
 '''
 
 
@@ -127,7 +158,7 @@ class ScriptTests(unittest.TestCase):
         result = subprocess.run(["ssh-keygen", "-lf", str(ROOT / "ssh-client.pub")], capture_output=True, text=True, check=True)
         self.assertIn("3072 SHA256:5X/MGOxI4MYB+q/B/L6ZOjzCRDfg36uBrljsZt+109c", result.stdout)
 
-    def run_ps(self, name, case, options, success):
+    def run_ps(self, name, case, options, success, defaults=False, positional=()):
         with tempfile.TemporaryDirectory(prefix="wsl-base-script-test-") as tmp:
             tmp = Path(tmp)
             original = ROOT / "scripts" / name
@@ -141,9 +172,21 @@ class ScriptTests(unittest.TestCase):
             image = tmp / "fixture.wsl"
             image.write_bytes(b"synthetic rootfs, never imported")
             if name == "install.ps1":
-                options = {"Flake": "github:fixture/wsl-base/" + "a" * 40 + "#wsl-base",
-                           "ImagePath": str(image), "ImageSha256": hashlib.sha256(image.read_bytes()).hexdigest(),
-                           "InstallDirectory": str(tmp / "installation")} | options
+                if case.startswith("download-"):
+                    image.unlink()
+                if case == "nonempty":
+                    (tmp / "installation").mkdir()
+                    (tmp / "installation/keep.txt").write_text("existing data")
+                if case == "image-directory":
+                    image.unlink()
+                    image.mkdir()
+                if case == "image-symlink":
+                    image.rename(tmp / "real.wsl")
+                    image.symlink_to(tmp / "real.wsl")
+                if not defaults:
+                    options = {"Flake": "github:fixture/wsl-base/" + "a" * 40 + "#wsl-base",
+                               "ImagePath": str(image), "ImageSha256": hashlib.sha256(b"synthetic rootfs, never imported").hexdigest(),
+                               "InstallDirectory": str(tmp / "installation")} | options
             else:
                 options = {"ListenAddress": "192.168.1.50", "AllowedRemoteAddress": ["192.168.1.10", "100.64.0.10/32"]} | options
                 if case in ("owned", "owned-mismatch", "remove"):
@@ -157,6 +200,7 @@ class ScriptTests(unittest.TestCase):
             log = tmp / "calls.jsonl"
             env = os.environ | {"TEST_SCRIPT": str(script), "TEST_ORIGINAL": str(original), "TEST_CASE": case,
                                 "TEST_LOG": str(log), "TEST_OPTIONS": str(options_file),
+                                "TEST_POSITIONAL": json.dumps(positional),
                                 "LOCALAPPDATA": str(tmp), "ProgramData": str(tmp)}
             result = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(harness)],
                                     env=env, capture_output=True, text=True)
@@ -164,6 +208,14 @@ class ScriptTests(unittest.TestCase):
             calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
             state = tmp / "nixos-wsl-base/NixOS-WSL-NixOS-Managed-192-168-1-50-2222.json"
             record = json.loads(state.read_text(encoding="utf-8-sig")) if state.exists() else None
+            if name == "install.ps1":
+                self.assertEqual(list(tmp.glob(".nixos-download-*.wsl")), [], "Temporary download must be cleaned up")
+                if case.startswith("download-"):
+                    self.assertEqual(image.exists(), success, "Only verified downloads may reach the final path")
+                if case == "bad-hash":
+                    self.assertEqual(image.read_bytes(), b"synthetic rootfs, never imported")
+                if case == "defaults":
+                    self.assertEqual((tmp / "nixos.wsl").read_bytes(), b"synthetic rootfs, never imported")
             return calls, record
 
     @unittest.skipUnless(PWSH, "pwsh unavailable")
@@ -171,15 +223,66 @@ class ScriptTests(unittest.TestCase):
         calls, _ = self.run_ps("install.ps1", "new", {"RestartDistribution": True}, True)
         operations = [c["value"][0] for c in calls if c["kind"] == "wsl"]
         self.assertEqual(operations, ["--list", "--import", "--distribution", "--terminate"])
-        self.assertEqual(calls[1]["value"][1], "NixOS-Managed")
+        self.assertEqual(next(c["value"] for c in calls if c["kind"] == "wsl" and c["value"][0] == "--import")[1], "NixOS-Managed")
+        self.assertFalse(any(c["kind"] in ("download", "resolve") for c in calls))
         for case, options in (("existing", {}), ("list-failure", {}), ("import-failure", {}),
                               ("guest-failure", {}), ("bad-hash", {"ImageSha256": "0" * 64}),
+                              ("nonempty", {}), ("image-directory", {}), ("image-symlink", {}),
                               ("moving-ref", {"Flake": "github:fixture/wsl-base/main#wsl-base"})):
             with self.subTest(case=case):
                 calls, _ = self.run_ps("install.ps1", case, options, False)
                 self.assertFalse(any(c["value"][0] == "--terminate" for c in calls if c["kind"] == "wsl"))
-                if case in ("existing", "list-failure", "bad-hash", "moving-ref"):
+                if case not in ("import-failure", "guest-failure"):
                     self.assertFalse(any(c["value"][0] == "--import" for c in calls if c["kind"] == "wsl"))
+                self.assertFalse(any(c["kind"] in ("download", "resolve") for c in calls))
+
+    @unittest.skipUnless(PWSH, "pwsh unavailable")
+    def test_install_distribution_binding(self):
+        for positional, named in ((("NixOS-Work",), {}), ((), {"Distribution": "NixOS-Work"})):
+            with self.subTest(positional=positional):
+                calls, _ = self.run_ps("install.ps1", "new", named | {
+                    "RestartDistribution": True, "InstallDirectory": None,
+                }, True, positional=positional)
+                wsl = [c["value"] for c in calls if c["kind"] == "wsl"]
+                imported = next(c for c in wsl if c[0] == "--import")
+                self.assertEqual(imported[1], "NixOS-Work")
+                self.assertEqual(Path(imported[2]).name, "NixOS-Work")
+                guest = next(c for c in wsl if "/bin/bash" in c)
+                self.assertEqual(guest[1], "NixOS-Work")
+                self.assertEqual(guest[-1], "github:fixture/wsl-base/" + "a" * 40 + "#wsl-base")
+                self.assertEqual(wsl[-1], ["--terminate", "NixOS-Work"])
+        for positional in (("invalid_name",), ("NixOS-Work", "unexpected")):
+            with self.subTest(positional=positional):
+                calls, _ = self.run_ps("install.ps1", "new", {}, False, positional=positional)
+                self.assertEqual(calls, [], "Binding errors must occur before any operation")
+
+    @unittest.skipUnless(PWSH, "pwsh unavailable")
+    def test_install_defaults_and_download_mocks(self):
+        calls, _ = self.run_ps("install.ps1", "defaults", {}, True, defaults=True)
+        download = next(c["value"] for c in calls if c["kind"] == "download")
+        self.assertEqual(download["uri"], "https://github.com/nix-community/NixOS-WSL/releases/download/2605.7.2/nixos.wsl")
+        self.assertEqual([c["value"] for c in calls if c["kind"] == "resolve"],
+                         ["https://api.github.com/repos/swayf/nixos-wsl-base/commits?per_page=1"])
+        guest = next(c["value"] for c in calls if c["kind"] == "wsl" and "/bin/bash" in c["value"])
+        self.assertEqual(guest[-1], "github:swayf/nixos-wsl-base/" + "b" * 40 + "#wsl-base")
+        for case in ("download-new", "download-failure", "download-bad-hash"):
+            success = case == "download-new"
+            calls, _ = self.run_ps("install.ps1", case, {}, success)
+            self.assertEqual(sum(c["kind"] == "download" for c in calls), 1)
+            self.assertEqual(any(c["kind"] == "wsl" and c["value"][0] == "--import" for c in calls), success)
+            self.assertFalse(any(c["kind"] == "resolve" for c in calls))
+        for flake in ("github:fixture/wsl-base", "github:fixture/wsl-base#other-host",
+                      "github:fixture/wsl-base/" + "a" * 40):
+            calls, _ = self.run_ps("install.ps1", "resolve", {"Flake": flake}, True)
+            guest = next(c["value"] for c in calls if c["kind"] == "wsl" and "/bin/bash" in c["value"])
+            host = "other-host" if "#other-host" in flake else "wsl-base"
+            sha = "a" * 40 if "/" + "a" * 40 in flake else "b" * 40
+            self.assertEqual(guest[-1], f"github:fixture/wsl-base/{sha}#{host}")
+            self.assertEqual(sum(c["kind"] == "resolve" for c in calls), int(sha == "b" * 40))
+            self.assertFalse(any(c["kind"] == "download" for c in calls))
+        for case in ("api-failure", "api-empty", "api-bad-sha"):
+            calls, _ = self.run_ps("install.ps1", case, {"Flake": "github:fixture/wsl-base"}, False)
+            self.assertFalse(any(c["kind"] == "wsl" and c["value"][0] == "--import" for c in calls))
 
     @unittest.skipUnless(PWSH, "pwsh unavailable")
     def test_nat_exposure_native_mocks(self):

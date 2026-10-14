@@ -46,8 +46,10 @@ SSH. У каждого профиля полноценная NixOS-конфиг�
   pins сохранены от проверенного существующего WSL snapshot.
 - `host.nix`, `ssh-client.pub`: публичная operator декларация.
 - `modules/management.nix`: общая SSH/admin-база, без fleet imports.
-- `scripts/install.ps1`: fresh first install из проверенного rootfs и
-  `github:owner/repo/<40-character-commit>#wsl-base`; существующая distro отклоняется.
+- `scripts/install.ps1`: fresh first install; по умолчанию последний commit
+  `github:swayf/nixos-wsl-base`, закрепляемый до импорта, и `nixos.wsl` рядом
+  со скриптом (скачивание при отсутствии, обязательный SHA256).
+  Существующая distro отклоняется.
 - `scripts/expose-ssh.ps1`: NAT exposure/refresh/удаление одного owned endpoint.
 - `tests/`: Nix contracts, Bash syntax, public-source boundaries,
   PowerShell parser/native mocks (если `pwsh` доступен). Они не запускают реальный WSL.
@@ -82,10 +84,13 @@ git push -u origin main
 git rev-parse HEAD
 ```
 
-Сохранить точный опубликованный commit из последней команды; не использовать
-`main`, `latest` или moving ref для установки. Передать Windows bootstrap из
-доверенной проверенной копии этого commit. Скрипт с административными полномочиями
-также требует доверия, а checksum rootfs не проверяет происхождение самого скрипта.
+Сохранить точный опубликованный commit из последней команды. Для повторяемой
+установки передать его через `-Flake`; `main`/`latest` не принимаются.
+Без revision скрипт один раз получает последний commit default branch через
+GitHub API и дальше использует только этот SHA. Такой запуск выбирает текущее
+состояние репозитория, а не заранее проверенный commit.
+Передать Windows bootstrap из доверенной проверенной копии. Сам скрипт также
+требует доверия, а checksum rootfs не проверяет происхождение скрипта/flake.
 
 ## A2 — fresh first install, Windows
 
@@ -101,7 +106,7 @@ e7180ad555fdcb8e1e057e2ef056de467603a5e502ff8531053738371be3f6b9
 и HTTPS GitHub API asset digest. Он bootstrap-only: installed system использует
 flake pins, а не версии пакетов initial rootfs. Cold-cache target build не проверен.
 
-Перенести rootfs и `scripts/` в Windows, например `C:\Deployments\nixos-wsl-base`.
+Перенести `scripts/` в Windows, например `C:\Deployments\nixos-wsl-base`.
 PowerShell **пользователя-владельца WSL**, не чужой administrator account:
 
 ```powershell
@@ -109,22 +114,49 @@ wsl --version
 wsl --list --verbose
 Set-Location C:\Deployments\nixos-wsl-base
 
-.\scripts\install.ps1 `
-  -Flake 'github:YOUR_ACCOUNT/nixos-wsl-base/PUBLISHED_40_CHARACTER_COMMIT#wsl-base' `
-  -ImagePath .\nixos.wsl `
-  -ImageSha256 'e7180ad555fdcb8e1e057e2ef056de467603a5e502ff8531053738371be3f6b9' `
-  -Distribution NixOS-Managed `
-  -RestartDistribution
+.\scripts\install.ps1 -RestartDistribution
 
 wsl -d NixOS-Managed -u swayf
 ```
 
-Заменить owner/commit НАСТОЯЩИМИ значениями. `NixOS-Managed` — новый отдельный
-экземпляр; существующие WSL-дистрибуции не затрагиваются. Скрипт
-проверяет rootfs SHA256, отказывает на существующую distro/non-empty destination,
-собирает pinned flake, проверяет ключевой-only SSH и **применяет базовую систему**.
-При ошибке сохраняет distro для диагностики; не удалять/reimport вслепую.
-`-RestartDistribution` явно завершает только новую distro.
+Имя новой дистрибуции — необязательный первый позиционный параметр:
+
+```powershell
+.\scripts\install.ps1 NixOS-Work -RestartDistribution
+wsl -d NixOS-Work -u swayf
+```
+
+Именованная форма `-Distribution NixOS-Work` также поддерживается.
+Без имени используется `NixOS-Managed`; остальные параметры передаются по имени.
+
+По умолчанию `-Flake 'github:swayf/nixos-wsl-base'`: скрипт получает SHA
+последнего commit default branch, добавляет `#wsl-base` и выводит точную ссылку
+до импорта. При ошибке GitHub API импорт не выполняется. Для заранее проверенного
+commit вместо автоматического выбора:
+
+```powershell
+.\scripts\install.ps1 `
+  -Flake 'github:swayf/nixos-wsl-base/PUBLISHED_40_CHARACTER_COMMIT#wsl-base' `
+  -RestartDistribution
+```
+
+Заменить placeholder настоящим опубликованным SHA. Выбранная ссылка сохраняется
+после успешной activation в `/var/lib/nixos-wsl-base/bootstrap-ref`.
+
+Образ по умолчанию — `scripts\nixos.wsl`, рядом с `install.ps1`, независимо от
+текущего каталога PowerShell. Если его нет, скрипт скачивает именно release
+**2605.7.2** по HTTPS во временный файл и перемещает на место только после
+проверки указанного выше SHA256. Неудачная/повреждённая загрузка удаляется;
+существующий файл с неправильным SHA256 отклоняется, не заменяется автоматически.
+Можно заранее положить образ рядом со скриптом либо передать `-ImagePath`;
+`-ImageSha256` также доступен для явно выбранного другого локального rootfs.
+
+`NixOS-Managed` — новый отдельный экземпляр; существующие WSL-дистрибуции не
+затрагиваются. Скрипт отказывает на существующую distro/non-empty destination
+до скачивания, проверяет rootfs SHA256, собирает pinned flake, проверяет
+key-only SSH и **применяет базовую систему**. При ошибке сохраняет distro для
+диагностики; не удалять/reimport вслепую. `-RestartDistribution` явно завершает
+только новую distro.
 
 ## A3 — открыть SSH только выбранному Linux-клиенту
 

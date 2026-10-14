@@ -1,13 +1,14 @@
 #Requires -Version 5.1
 <# First install ONLY. Import a new distro, apply a pinned public GitHub flake.
 No private keys, portproxy/firewall changes, unregister or global shutdown. #>
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
-    [Parameter(Mandatory = $true)]
-    [ValidatePattern('^github:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[a-f0-9]{40}#[a-z][a-z0-9-]*$')]
-    [string]$Flake,
-    [Parameter(Mandatory = $true)][string]$ImagePath,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[a-f0-9]{64}$')][string]$ImageSha256,
+    [ValidatePattern('^github:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(/[a-f0-9]{40})?(#[a-z][a-z0-9-]*)?$')]
+    [string]$Flake = 'github:swayf/nixos-wsl-base',
+    [string]$ImagePath = (Join-Path $PSScriptRoot 'nixos.wsl'),
+    [ValidatePattern('^[a-f0-9]{64}$')]
+    [string]$ImageSha256 = 'e7180ad555fdcb8e1e057e2ef056de467603a5e502ff8531053738371be3f6b9',
+    [Parameter(Position = 0)]
     [ValidatePattern('^[A-Za-z][A-Za-z0-9-]{0,63}$')][string]$Distribution = 'NixOS-Managed',
     [string]$InstallDirectory,
     [switch]$RestartDistribution
@@ -35,12 +36,6 @@ $null = Get-Command wsl.exe -ErrorAction Stop
 $architecture = $env:PROCESSOR_ARCHITEW6432
 if (-not $architecture) { $architecture = $env:PROCESSOR_ARCHITECTURE }
 if ($architecture -ne 'AMD64') { throw 'This base currently supports x86_64 Windows only.' }
-$ImagePath = (Resolve-Path -LiteralPath $ImagePath).ProviderPath
-Assert-NoReparsePath $ImagePath
-if ((Get-Item -LiteralPath $ImagePath).PSIsContainer -or
-    (Get-FileHash -LiteralPath $ImagePath -Algorithm SHA256).Hash -ine $ImageSha256) {
-    throw 'Rootfs checksum/type mismatch. Nothing imported.'
-}
 $list = (Invoke-Native wsl.exe @('--list', '--quiet')) -join "`n"
 $existing = @($list.Replace([string][char]0, '').Split("`n") | ForEach-Object { $_.Trim() })
 if ($existing -contains $Distribution) { throw 'Distribution exists. Use SSH/nixos-rebuild to update; never overwrite it here.' }
@@ -52,6 +47,52 @@ if ((Test-Path -LiteralPath $InstallDirectory) -and
      @(Get-ChildItem -LiteralPath $InstallDirectory -Force).Count -gt 0)) {
     throw 'Install destination must be new or an empty directory.'
 }
+$ImagePath = [IO.Path]::GetFullPath($ImagePath)
+Assert-NoReparsePath $ImagePath
+if (-not (Test-Path -LiteralPath (Split-Path -Parent $ImagePath) -PathType Container)) {
+    throw 'Rootfs parent directory must exist.'
+}
+$oldProtocol = [Net.ServicePointManager]::SecurityProtocol
+$oldProgress = $ProgressPreference
+try {
+    # Windows PowerShell 5.1 can otherwise default to protocols GitHub refuses.
+    [Net.ServicePointManager]::SecurityProtocol = $oldProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $ProgressPreference = 'SilentlyContinue'
+    if (-not (Test-Path -LiteralPath $ImagePath)) {
+        $imageUrl = 'https://github.com/nix-community/NixOS-WSL/releases/download/2605.7.2/nixos.wsl'
+        $temporaryImage = Join-Path (Split-Path -Parent $ImagePath) ('.nixos-download-' + [guid]::NewGuid().ToString('N') + '.wsl')
+        Write-Host "Downloading rootfs: $imageUrl"
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $imageUrl -OutFile $temporaryImage -TimeoutSec 600 | Out-Null
+            if ((Get-FileHash -LiteralPath $temporaryImage -Algorithm SHA256).Hash -ine $ImageSha256) {
+                throw 'Downloaded rootfs checksum mismatch. Nothing imported.'
+            }
+            # Keep the final path untouched until a complete download is verified.
+            Move-Item -LiteralPath $temporaryImage -Destination $ImagePath
+        } finally {
+            if (Test-Path -LiteralPath $temporaryImage) { Remove-Item -LiteralPath $temporaryImage -Force }
+        }
+    }
+    if ((Get-Item -LiteralPath $ImagePath).PSIsContainer -or
+        (Get-FileHash -LiteralPath $ImagePath -Algorithm SHA256).Hash -ine $ImageSha256) {
+        throw 'Rootfs checksum/type mismatch. Nothing imported.'
+    }
+    if ($Flake -notmatch '#') { $Flake += '#wsl-base' }
+    if ($Flake -match '^github:([^/]+)/([^/#]+)#([a-z][a-z0-9-]*)$') {
+        $owner = $Matches[1]; $repo = $Matches[2]; $hostName = $Matches[3]
+        # Resolve the default branch once; every guest operation uses this SHA.
+        $commits = @(Invoke-RestMethod -Uri "https://api.github.com/repos/$owner/$repo/commits?per_page=1" `
+            -Headers @{ 'User-Agent' = 'nixos-wsl-base-installer'; Accept = 'application/vnd.github+json' } -TimeoutSec 30)
+        if ($commits.Count -ne 1 -or $commits[0].sha -cnotmatch '^[a-f0-9]{40}$') {
+            throw 'GitHub did not return one immutable commit. Nothing imported.'
+        }
+        $Flake = "github:$owner/$repo/$($commits[0].sha)#$hostName"
+    }
+} finally {
+    [Net.ServicePointManager]::SecurityProtocol = $oldProtocol
+    $ProgressPreference = $oldProgress
+}
+Write-Host "Installing exact flake: $Flake"
 $null = Invoke-Native wsl.exe @('--import', $Distribution, $InstallDirectory, $ImagePath, '--version', '2')
 $guest = @'
 set -euo pipefail
